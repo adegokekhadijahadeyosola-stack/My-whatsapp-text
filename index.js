@@ -6,12 +6,12 @@ app.use(express.json());
 // ---- Config (set these as environment variables on Render) ----
 const {
   VERIFY_TOKEN,       // any string you invent; must match Meta webhook setup
-  WHATSAPP_TOKEN,     // access token from Meta (API Setup page)
+  WHATSAPP_TOKEN,     // access token from Meta (System User token, not the temporary Explorer one)
   PHONE_NUMBER_ID,    // the test number's Phone Number ID (not the phone number itself)
   GEMINI_API_KEY,     // free key from Google AI Studio
 } = process.env;
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 const GRAPH_VERSION = process.env.GRAPH_VERSION || "v21.0";
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
@@ -34,7 +34,7 @@ const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GE
 const WA_URL = `https://graph.facebook.com/${GRAPH_VERSION}/${PHONE_NUMBER_ID}/messages`;
 
 // ---- Simple in-memory state (resets on restart/redeploy) ----
-const MAX_MESSAGES = 20;
+const MAX_MESSAGES = 10; // trimmed from 20 - shorter context, faster Gemini responses
 const history = new Map();       // sender -> [{ role, parts }]
 const seenIds = new Set();       // dedupe WhatsApp retries
 
@@ -57,6 +57,7 @@ async function askGemini(sender, text) {
     body: JSON.stringify({
       system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
       contents: history.get(sender),
+      generationConfig: { maxOutputTokens: 200 }, // caps reply length -> faster generation
     }),
   });
 
@@ -100,8 +101,32 @@ async function sendWhatsApp(to, body) {
   }
 }
 
+// Marks the incoming message as read AND shows the "typing..." bubble.
+// The typing indicator disappears automatically once sendWhatsApp() replies,
+// or after 25 seconds if no reply is sent by then.
+async function showTypingIndicator(messageId) {
+  const res = await fetch(WA_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      status: "read",
+      message_id: messageId,
+      typing_indicator: { type: "text" },
+    }),
+  });
+  if (!res.ok) {
+    console.error("Typing indicator failed:", res.status, await res.text());
+  }
+}
+
 async function handleMessage(msg) {
   const sender = msg.from;
+
+  await showTypingIndicator(msg.id);
 
   if (msg.type !== "text") {
     await sendWhatsApp(sender, "I can only read text messages for now.");
