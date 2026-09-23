@@ -38,14 +38,16 @@ const WA_URL = `https://graph.facebook.com/${GRAPH_VERSION}/${PHONE_NUMBER_ID}/m
 
 // ---- Automatic Gemini model resolution ----
 // Rather than hardcoding a model name that Google can deprecate at any time,
-// we ask the API which models currently exist and pick the best match.
-// Result is cached and refreshed periodically (and on demand if a call fails).
+// we ask the API which models currently exist, rank them, and keep a
+// fallback chain: if the top pick is rate-limited or out of free-tier quota,
+// we move to the next one instead of just failing.
 const MODEL_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // re-check every 6 hours
-let modelCache = { name: null, resolvedAt: 0 };
+let modelCache = { ranked: [], cursor: 0, resolvedAt: 0 };
 
 // Preference order: newest/best "flash" family first, since that's what this
 // bot was built around (fast + cheap). Adjust this list if you'd rather
-// default to "pro" models instead.
+// default to "pro" models instead. Every model, matched or not, ends up
+// somewhere in the ranked list - nothing is dropped, just deprioritized.
 const MODEL_PREFERENCE_PATTERNS = [
   /^models\/gemini-.*flash-latest$/,
   /^models\/gemini-\d+(\.\d+)*-flash$/,
@@ -67,29 +69,59 @@ async function listAvailableModels() {
   );
 }
 
-function pickBestModel(models) {
+function rankModels(models) {
+  const seen = new Set();
+  const ranked = [];
   for (const pattern of MODEL_PREFERENCE_PATTERNS) {
-    const match = models.find((m) => pattern.test(m.name));
-    if (match) return match.name.replace(/^models\//, "");
+    for (const m of models) {
+      const name = m.name.replace(/^models\//, "");
+      if (pattern.test(m.name) && !seen.has(name)) {
+        ranked.push(name);
+        seen.add(name);
+      }
+    }
   }
-  // Fall back to whatever the API returns first, rather than failing outright.
-  if (models.length > 0) return models[0].name.replace(/^models\//, "");
-  throw new Error("No Gemini models with generateContent support are available");
+  // Anything left over (didn't match any preference pattern) still goes in,
+  // at the back of the line, so we never end up with zero fallback options.
+  for (const m of models) {
+    const name = m.name.replace(/^models\//, "");
+    if (!seen.has(name)) {
+      ranked.push(name);
+      seen.add(name);
+    }
+  }
+  return ranked;
 }
 
+async function getModelCandidates({ force = false } = {}) {
+  const isStale = Date.now() - modelCache.resolvedAt > MODEL_CACHE_TTL_MS;
+  if (force || modelCache.ranked.length === 0 || isStale) {
+    const models = await listAvailableModels();
+    const ranked = rankModels(models);
+    if (ranked.length === 0) {
+      throw new Error("No Gemini models with generateContent support are available");
+    }
+    console.log(`Gemini models available: ${ranked.join(", ")}`);
+    modelCache = { ranked, cursor: 0, resolvedAt: Date.now() };
+  }
+  return modelCache.ranked;
+}
+
+// Current best-guess model (top of the ranked list, or wherever the cursor
+// has moved to after earlier fallbacks this cycle).
 async function resolveGeminiModel({ force = false } = {}) {
   if (GEMINI_MODEL_OVERRIDE) return GEMINI_MODEL_OVERRIDE;
+  const ranked = await getModelCandidates({ force });
+  return ranked[Math.min(modelCache.cursor, ranked.length - 1)];
+}
 
-  const isStale = Date.now() - modelCache.resolvedAt > MODEL_CACHE_TTL_MS;
-  if (force || !modelCache.name || isStale) {
-    const models = await listAvailableModels();
-    const chosen = pickBestModel(models);
-    if (chosen !== modelCache.name) {
-      console.log(`Gemini model resolved: ${modelCache.name || "(none)"} -> ${chosen}`);
-    }
-    modelCache = { name: chosen, resolvedAt: Date.now() };
-  }
-  return modelCache.name;
+// Moves to the next candidate model. Returns the new model name, or null if
+// every known model has already been tried this cycle.
+function advanceModel() {
+  if (GEMINI_MODEL_OVERRIDE) return null;
+  modelCache.cursor += 1;
+  if (modelCache.cursor >= modelCache.ranked.length) return null;
+  return modelCache.ranked[modelCache.cursor];
 }
 
 // ---- Simple in-memory state (resets on restart/redeploy) ----
@@ -140,48 +172,93 @@ function sleep(ms) {
 async function askGemini(sender, text) {
   remember(sender, "user", text);
 
-  let modelName = await resolveGeminiModel();
+  // If the person pinned a model via GEMINI_MODEL, there's no fallback chain
+  // to walk - just call it, with the existing thinking-field and 503 retries.
+  if (GEMINI_MODEL_OVERRIDE) {
+    const reply = await callGeminiWithRetries(sender, GEMINI_MODEL_OVERRIDE);
+    return reply;
+  }
+
+  await getModelCandidates(); // make sure modelCache.ranked is populated
+
+  let lastFailure = null;
+  while (true) {
+    const modelName = modelCache.ranked[modelCache.cursor];
+    let result;
+    try {
+      result = await callGeminiWithRetries(sender, modelName, { returnFailures: true });
+    } catch (err) {
+      // Non-recoverable error (bad request unrelated to model/quota) - stop.
+      throw err;
+    }
+
+    if (result.ok) {
+      return result.reply;
+    }
+
+    // 429 = rate-limited or free-tier quota exhausted for this model.
+    // 404/400 "not found" = model retired/renamed.
+    // Either way, move on to the next model rather than telling the user
+    // Gemini is "down" when really just one model is unavailable.
+    console.warn(`Model "${modelName}" unavailable (${result.status}), trying next model...`);
+    lastFailure = result;
+    const next = advanceModel();
+    if (!next) break;
+  }
+
+  // Every known model failed. Reset the cursor so the next incoming message
+  // starts again from the top of the list (quotas may free up by then).
+  modelCache.cursor = 0;
+  history.get(sender).pop();
+
+  if (lastFailure?.status === 429) {
+    return "All my available Gemini models are rate-limited or out of free quota for now. Please try again in a bit.";
+  }
+  return "Gemini isn't available right now. Please try again shortly.";
+}
+
+// Calls one specific model, with the thinking-field retry and one 503 retry
+// baked in. With returnFailures:true, recoverable failures (429/503/404-ish)
+// are returned as { ok:false, status } instead of throwing, so the caller
+// can decide whether to fall back to another model.
+async function callGeminiWithRetries(sender, modelName, { returnFailures = false } = {}) {
   let skipThinkingControl = false;
   let res = await callGemini(sender, modelName, { skipThinkingControl });
 
-  // If the model rejects the thinkingLevel field outright (older/newer
-  // models sometimes disagree on the shape), retry once without it.
   if (!res.ok && res.status === 400) {
     const bodyText = await res.text();
     if (/thinking(Level|Config|Budget)/i.test(bodyText)) {
-      console.warn("Gemini rejected thinkingConfig, retrying without it...");
+      console.warn(`Gemini (${modelName}) rejected thinkingConfig, retrying without it...`);
       skipThinkingControl = true;
       res = await callGemini(sender, modelName, { skipThinkingControl });
     } else if (/not found|not supported|deprecated/i.test(bodyText)) {
-      modelName = await resolveGeminiModel({ force: true });
-      res = await callGemini(sender, modelName, { skipThinkingControl });
+      if (returnFailures) return { ok: false, status: 404 };
+      history.get(sender).pop();
+      throw new Error(`Gemini error 400: ${bodyText}`);
     } else {
+      if (returnFailures) return { ok: false, status: 400 };
       history.get(sender).pop();
       throw new Error(`Gemini error 400: ${bodyText}`);
     }
-  } else if (!res.ok && res.status === 404 && !GEMINI_MODEL_OVERRIDE) {
-    // Model retired/renamed - force a re-resolve and retry once.
-    const bodyText = await res.text();
-    console.warn(`Gemini model "${modelName}" seems unavailable, re-resolving...`);
-    modelName = await resolveGeminiModel({ force: true });
-    res = await callGemini(sender, modelName, { skipThinkingControl });
+  } else if (!res.ok && res.status === 404) {
+    if (returnFailures) return { ok: false, status: 404 };
   }
 
-  // 503 "overloaded" is usually a brief spike on Google's end - one quick
-  // retry often succeeds without bothering the user.
+  // 503 "overloaded" is usually a brief spike - one quick retry on the same
+  // model often succeeds without needing to fall back to a different one.
   if (res.status === 503) {
     await sleep(1000);
     res = await callGemini(sender, modelName, { skipThinkingControl });
   }
 
-  if (res.status === 429) {
+  if (res.status === 429 || res.status === 503) {
+    if (returnFailures) return { ok: false, status: res.status };
     history.get(sender).pop();
-    return "I'm getting too many requests right now. Please try again in a minute.";
+    return res.status === 429
+      ? "I'm getting too many requests right now. Please try again in a minute."
+      : "Gemini is under heavy load right now. Please try again shortly.";
   }
-  if (res.status === 503) {
-    history.get(sender).pop();
-    return "Gemini is under heavy load right now. Please try again shortly.";
-  }
+
   if (!res.ok) {
     history.get(sender).pop();
     throw new Error(`Gemini error ${res.status}: ${await res.text()}`);
@@ -190,13 +267,15 @@ async function askGemini(sender, text) {
   const data = await res.json();
   const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
   if (!reply) {
+    console.error(`Empty Gemini response from ${modelName}:`, JSON.stringify(data));
+    if (returnFailures) return { ok: false, status: "empty" };
     history.get(sender).pop();
-    console.error("Unexpected Gemini response:", JSON.stringify(data));
     return "Sorry, I couldn't generate a reply. Please try again.";
   }
 
   remember(sender, "model", reply);
-  return reply.slice(0, 4000); // WhatsApp text limit is 4096
+  const trimmed = reply.slice(0, 4000); // WhatsApp text limit is 4096
+  return returnFailures ? { ok: true, reply: trimmed } : trimmed;
 }
 
 async function sendWhatsApp(to, body) {
@@ -270,11 +349,35 @@ async function handleMessage(msg) {
 // Health check (also useful for an uptime pinger on Render's free tier)
 app.get("/", (req, res) => res.status(200).send("ok"));
 
-// Optional: inspect which model is currently in use
+// Inspect which model is currently active
 app.get("/model", async (req, res) => {
   try {
     const modelName = await resolveGeminiModel();
     res.status(200).json({ model: modelName, override: !!GEMINI_MODEL_OVERRIDE });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Lists every model your API key currently has access to (that supports
+// generateContent), in the order the bot will try them. Handy for checking
+// what's available on the free tier without digging through AI Studio.
+app.get("/models", async (req, res) => {
+  if (GEMINI_MODEL_OVERRIDE) {
+    return res.status(200).json({
+      override: true,
+      model: GEMINI_MODEL_OVERRIDE,
+      note: "GEMINI_MODEL is set, so auto fallback is disabled. Unset it to enable the fallback chain.",
+    });
+  }
+  try {
+    const ranked = await getModelCandidates({ force: req.query.refresh === "1" });
+    res.status(200).json({
+      override: false,
+      currentModel: ranked[Math.min(modelCache.cursor, ranked.length - 1)],
+      cursor: modelCache.cursor,
+      candidatesInOrder: ranked,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
