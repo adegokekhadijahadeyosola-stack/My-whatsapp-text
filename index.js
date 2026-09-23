@@ -104,8 +104,21 @@ function remember(sender, role, text) {
   history.set(sender, list);
 }
 
-async function callGemini(sender, modelName) {
+async function callGemini(sender, modelName, { skipThinkingControl = false } = {}) {
   const url = `${GEMINI_API_BASE}/models/${modelName}:generateContent`;
+
+  const generationConfig = { maxOutputTokens: 300 };
+  if (!skipThinkingControl) {
+    // Gemini 3.x models replaced the old numeric "thinkingBudget" with a
+    // "thinkingLevel" enum (minimal/low/medium/high) and silently ignore
+    // thinkingBudget entirely, defaulting to "medium" thinking. Since
+    // thinking tokens are drawn from the same maxOutputTokens budget as the
+    // actual reply, an ignored thinkingBudget can silently eat the whole
+    // budget and leave nothing for the answer. "low" is the safest floor:
+    // some model versions don't support "minimal" and reject it outright.
+    generationConfig.thinkingConfig = { thinkingLevel: "low" };
+  }
+
   return fetch(url, {
     method: "POST",
     headers: {
@@ -115,35 +128,59 @@ async function callGemini(sender, modelName) {
     body: JSON.stringify({
       system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
       contents: history.get(sender),
-      generationConfig: { maxOutputTokens: 200 }, // caps reply length -> faster generation
+      generationConfig,
     }),
   });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function askGemini(sender, text) {
   remember(sender, "user", text);
 
   let modelName = await resolveGeminiModel();
-  let res = await callGemini(sender, modelName);
+  let skipThinkingControl = false;
+  let res = await callGemini(sender, modelName, { skipThinkingControl });
 
-  // If the model we're using has been retired/renamed (404) or otherwise
-  // rejected (400 "not found"), force a re-resolve and retry once.
-  if (!GEMINI_MODEL_OVERRIDE && (res.status === 404 || res.status === 400)) {
+  // If the model rejects the thinkingLevel field outright (older/newer
+  // models sometimes disagree on the shape), retry once without it.
+  if (!res.ok && res.status === 400) {
     const bodyText = await res.text();
-    if (/not found|not supported|deprecated/i.test(bodyText)) {
-      console.warn(`Gemini model "${modelName}" seems unavailable, re-resolving...`);
+    if (/thinking(Level|Config|Budget)/i.test(bodyText)) {
+      console.warn("Gemini rejected thinkingConfig, retrying without it...");
+      skipThinkingControl = true;
+      res = await callGemini(sender, modelName, { skipThinkingControl });
+    } else if (/not found|not supported|deprecated/i.test(bodyText)) {
       modelName = await resolveGeminiModel({ force: true });
-      res = await callGemini(sender, modelName);
+      res = await callGemini(sender, modelName, { skipThinkingControl });
     } else {
-      // Not a model-availability issue; treat as a normal error below.
       history.get(sender).pop();
-      throw new Error(`Gemini error ${res.status}: ${bodyText}`);
+      throw new Error(`Gemini error 400: ${bodyText}`);
     }
+  } else if (!res.ok && res.status === 404 && !GEMINI_MODEL_OVERRIDE) {
+    // Model retired/renamed - force a re-resolve and retry once.
+    const bodyText = await res.text();
+    console.warn(`Gemini model "${modelName}" seems unavailable, re-resolving...`);
+    modelName = await resolveGeminiModel({ force: true });
+    res = await callGemini(sender, modelName, { skipThinkingControl });
+  }
+
+  // 503 "overloaded" is usually a brief spike on Google's end - one quick
+  // retry often succeeds without bothering the user.
+  if (res.status === 503) {
+    await sleep(1000);
+    res = await callGemini(sender, modelName, { skipThinkingControl });
   }
 
   if (res.status === 429) {
     history.get(sender).pop();
     return "I'm getting too many requests right now. Please try again in a minute.";
+  }
+  if (res.status === 503) {
+    history.get(sender).pop();
+    return "Gemini is under heavy load right now. Please try again shortly.";
   }
   if (!res.ok) {
     history.get(sender).pop();
@@ -206,7 +243,11 @@ async function showTypingIndicator(messageId) {
 async function handleMessage(msg) {
   const sender = msg.from;
 
-  await showTypingIndicator(msg.id);
+  // Fire-and-forget: the typing indicator doesn't need to finish before we
+  // start the (slower) Gemini call, so don't block on it.
+  showTypingIndicator(msg.id).catch((err) =>
+    console.error("Typing indicator failed:", err)
+  );
 
   if (msg.type !== "text") {
     await sendWhatsApp(sender, "I can only read text messages for now.");
