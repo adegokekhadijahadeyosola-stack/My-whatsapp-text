@@ -11,7 +11,10 @@ const {
   GEMINI_API_KEY,     // free key from Google AI Studio
 } = process.env;
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
+// If GEMINI_MODEL is set explicitly, it's honored as a pin/override.
+// If left unset, the server auto-discovers the best current model from
+// Google's API and re-discovers whenever the pinned/cached model stops working.
+const GEMINI_MODEL_OVERRIDE = process.env.GEMINI_MODEL || null;
 const GRAPH_VERSION = process.env.GRAPH_VERSION || "v21.0";
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
@@ -30,8 +33,64 @@ for (const [name, value] of Object.entries({
   }
 }
 
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta";
 const WA_URL = `https://graph.facebook.com/${GRAPH_VERSION}/${PHONE_NUMBER_ID}/messages`;
+
+// ---- Automatic Gemini model resolution ----
+// Rather than hardcoding a model name that Google can deprecate at any time,
+// we ask the API which models currently exist and pick the best match.
+// Result is cached and refreshed periodically (and on demand if a call fails).
+const MODEL_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // re-check every 6 hours
+let modelCache = { name: null, resolvedAt: 0 };
+
+// Preference order: newest/best "flash" family first, since that's what this
+// bot was built around (fast + cheap). Adjust this list if you'd rather
+// default to "pro" models instead.
+const MODEL_PREFERENCE_PATTERNS = [
+  /^models\/gemini-.*flash-latest$/,
+  /^models\/gemini-\d+(\.\d+)*-flash$/,
+  /^models\/gemini-\d+(\.\d+)*-flash-\d+$/,
+  /^models\/gemini-.*flash.*/,
+  /^models\/gemini-.*pro.*/,
+];
+
+async function listAvailableModels() {
+  const res = await fetch(`${GEMINI_API_BASE}/models`, {
+    headers: { "x-goog-api-key": GEMINI_API_KEY },
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to list Gemini models: ${res.status} ${await res.text()}`);
+  }
+  const data = await res.json();
+  return (data.models || []).filter((m) =>
+    (m.supportedGenerationMethods || []).includes("generateContent")
+  );
+}
+
+function pickBestModel(models) {
+  for (const pattern of MODEL_PREFERENCE_PATTERNS) {
+    const match = models.find((m) => pattern.test(m.name));
+    if (match) return match.name.replace(/^models\//, "");
+  }
+  // Fall back to whatever the API returns first, rather than failing outright.
+  if (models.length > 0) return models[0].name.replace(/^models\//, "");
+  throw new Error("No Gemini models with generateContent support are available");
+}
+
+async function resolveGeminiModel({ force = false } = {}) {
+  if (GEMINI_MODEL_OVERRIDE) return GEMINI_MODEL_OVERRIDE;
+
+  const isStale = Date.now() - modelCache.resolvedAt > MODEL_CACHE_TTL_MS;
+  if (force || !modelCache.name || isStale) {
+    const models = await listAvailableModels();
+    const chosen = pickBestModel(models);
+    if (chosen !== modelCache.name) {
+      console.log(`Gemini model resolved: ${modelCache.name || "(none)"} -> ${chosen}`);
+    }
+    modelCache = { name: chosen, resolvedAt: Date.now() };
+  }
+  return modelCache.name;
+}
 
 // ---- Simple in-memory state (resets on restart/redeploy) ----
 const MAX_MESSAGES = 10; // trimmed from 20 - shorter context, faster Gemini responses
@@ -45,10 +104,9 @@ function remember(sender, role, text) {
   history.set(sender, list);
 }
 
-async function askGemini(sender, text) {
-  remember(sender, "user", text);
-
-  const res = await fetch(GEMINI_URL, {
+async function callGemini(sender, modelName) {
+  const url = `${GEMINI_API_BASE}/models/${modelName}:generateContent`;
+  return fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -60,6 +118,28 @@ async function askGemini(sender, text) {
       generationConfig: { maxOutputTokens: 200 }, // caps reply length -> faster generation
     }),
   });
+}
+
+async function askGemini(sender, text) {
+  remember(sender, "user", text);
+
+  let modelName = await resolveGeminiModel();
+  let res = await callGemini(sender, modelName);
+
+  // If the model we're using has been retired/renamed (404) or otherwise
+  // rejected (400 "not found"), force a re-resolve and retry once.
+  if (!GEMINI_MODEL_OVERRIDE && (res.status === 404 || res.status === 400)) {
+    const bodyText = await res.text();
+    if (/not found|not supported|deprecated/i.test(bodyText)) {
+      console.warn(`Gemini model "${modelName}" seems unavailable, re-resolving...`);
+      modelName = await resolveGeminiModel({ force: true });
+      res = await callGemini(sender, modelName);
+    } else {
+      // Not a model-availability issue; treat as a normal error below.
+      history.get(sender).pop();
+      throw new Error(`Gemini error ${res.status}: ${bodyText}`);
+    }
+  }
 
   if (res.status === 429) {
     history.get(sender).pop();
@@ -149,6 +229,16 @@ async function handleMessage(msg) {
 // Health check (also useful for an uptime pinger on Render's free tier)
 app.get("/", (req, res) => res.status(200).send("ok"));
 
+// Optional: inspect which model is currently in use
+app.get("/model", async (req, res) => {
+  try {
+    const modelName = await resolveGeminiModel();
+    res.status(200).json({ model: modelName, override: !!GEMINI_MODEL_OVERRIDE });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Webhook verification (Meta calls this once when you save the webhook)
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
@@ -185,4 +275,12 @@ app.post("/webhook", (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`Server listening on port ${PORT}`);
+  try {
+    const modelName = await resolveGeminiModel();
+    console.log(`Using Gemini model: ${modelName}${GEMINI_MODEL_OVERRIDE ? " (pinned via GEMINI_MODEL)" : " (auto-resolved)"}`);
+  } catch (err) {
+    console.error("Could not resolve a Gemini model at startup:", err.message);
+  }
+});
